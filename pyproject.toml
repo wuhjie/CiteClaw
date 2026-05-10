@@ -32,16 +32,18 @@ topic_model = [
     "numpy>=1.24,<3",
 ]
 pdf = [
-    # PyMuPDF (``import pymupdf``) is the primary parser used by
-    # ``citeclaw.clients.pdf.parse_pdf_bytes`` — dramatically better
-    # column / reading-order extraction on two-column scientific PDFs
-    # than pypdf, and several times faster. Note: AGPL licensed.
+    # PyMuPDF (``import pymupdf``) backs the default lightweight engine
+    # in ``pdfclaw.parsers`` — fast, in-process, good reading order on
+    # most academic PDFs.  AGPL licensed.
     "pymupdf>=1.24,<2",
-    # ``pypdf`` is kept as a pure-Python fallback for environments where
-    # PyMuPDF cannot be installed (or where the AGPL is unacceptable).
-    # ``parse_pdf_bytes`` automatically falls back to pypdf if pymupdf
-    # is missing.
-    "pypdf>=4.0,<6",
+]
+docling = [
+    # IBM Docling — the recommended high-quality CPU/GPU parser
+    # registered as ``pdfclaw.parsers.DoclingParser``.  Pure-Python
+    # install (single line); model weights download on first run.
+    # Pick this when extraction quality on multi-column layouts and
+    # tables matters more than speed.
+    "docling>=2.0,<3",
 ]
 web = [
     "fastapi>=0.110,<1",
@@ -54,6 +56,9 @@ browser = [
     # chromium`` after the pip install.
     "playwright>=1.40,<2",
     "pymupdf>=1.24,<2",
+]
+all = [
+    "citeclaw[pdf,docling,topic_model,web,browser]",
 ]
 
 [project.scripts]
