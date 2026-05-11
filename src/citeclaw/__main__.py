@@ -673,15 +673,26 @@ def _build_meta_review_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--instruction", "-i",
         type=str,
-        required=True,
+        default=None,
         help='What to extract from each paper (free-form, e.g. '
-             '"Extract model architecture, n parameters, training objective, datasets").',
+             '"Extract model architecture, n parameters, training objective, datasets"). '
+             'Required unless --from-extractions is used.',
     )
     p.add_argument(
         "--extractor-model",
         type=str,
-        required=True,
-        help="Model alias for the per-paper extractor (must exist in the config's models registry).",
+        default=None,
+        help="Model alias for the per-paper extractor (must exist in the config's models registry). "
+             "Required unless --from-extractions is used.",
+    )
+    p.add_argument(
+        "--from-extractions",
+        type=Path,
+        default=None,
+        help="Path to an existing meta_review_extractions.json sidecar. When set, the per-paper "
+             "extraction pass is skipped and the meta LLM is called directly on the cached "
+             "extractions — useful for iterating on the meta prompt without re-running 60+ paper "
+             "extractions, or for recovering from a meta-side failure.",
     )
     p.add_argument(
         "--extractor-reasoning",
@@ -768,9 +779,32 @@ def _run_meta_review(argv: list[str]) -> None:
 
     config = load_settings(args.config, {})
 
-    # Pre-flight: check api_key_env for both aliases so we fail fast
-    # rather than mid-way through a long corpus.
-    for alias in (args.extractor_model, args.meta_model):
+    # Validate the meta-only vs full-run argument set.
+    if args.from_extractions is not None:
+        if not args.from_extractions.exists():
+            log.error("--from-extractions: file not found: %s", args.from_extractions)
+            sys.exit(1)
+        # extractor_model / instruction become optional in this mode —
+        # they'll be filled in from the sidecar's metadata.
+    else:
+        if not args.instruction:
+            log.error(
+                "--instruction is required unless --from-extractions is set"
+            )
+            sys.exit(2)
+        if not args.extractor_model:
+            log.error(
+                "--extractor-model is required unless --from-extractions is set"
+            )
+            sys.exit(2)
+
+    # Pre-flight: check api_key_env for each model alias that will
+    # actually be invoked.  When --from-extractions is set, only the
+    # meta model gets called.
+    aliases_to_check: list[str] = [args.meta_model]
+    if args.from_extractions is None and args.extractor_model:
+        aliases_to_check.append(args.extractor_model)
+    for alias in aliases_to_check:
         missing = _check_extract_info_llm_key(config, alias)
         if missing:
             log.error(
@@ -784,8 +818,8 @@ def _run_meta_review(argv: list[str]) -> None:
         result = run_meta_review(
             args.run_dir,
             config,
-            instruction=args.instruction,
-            extractor_model=args.extractor_model,
+            instruction=args.instruction or "",
+            extractor_model=args.extractor_model or "",
             extractor_reasoning=args.extractor_reasoning,
             meta_model=args.meta_model,
             meta_reasoning=args.meta_reasoning,
@@ -795,6 +829,7 @@ def _run_meta_review(argv: list[str]) -> None:
             pdf_input_max_chars=args.pdf_input_max_chars,
             parser=args.parser,
             parser_kwargs=_parse_kwarg_pairs(args.parser_kwargs),
+            from_extractions=args.from_extractions,
         )
     except FileNotFoundError as exc:
         log.error("meta-review failed: %s", exc)

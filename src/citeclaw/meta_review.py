@@ -168,6 +168,29 @@ _META_USER_TEMPLATE = (
 # ---------------------------------------------------------------------------
 
 
+def _read_parsed_text_from_disk(run_dir: Path, paper_id: str) -> str | None:
+    """Read pre-parsed body text from ``<run_dir>/parsed/<paper_id>.json``.
+
+    The ``fetch-pdfs`` CLI writes one JSON per paper into ``parsed/`` —
+    its schema includes a ``body_text`` field carrying the extracted
+    PDF body.  When the run directory has this artefact we prefer it
+    over hitting :class:`PdfClawBridge`: the cache table may carry a
+    stale ``error="no_pdf"`` row from the original pipeline run that
+    fired *before* ``fetch-pdfs`` populated the disk, which causes the
+    bridge to return ``None`` even though the text is in fact sitting
+    on disk.  Returns ``None`` when the file is missing or empty.
+    """
+    path = run_dir / "parsed" / f"{paper_id}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    text = (data.get("body_text") or "").strip()
+    return text or None
+
+
 def _extract_one_paper(
     paper: dict[str, Any],
     bridge,
@@ -176,6 +199,7 @@ def _extract_one_paper(
     *,
     per_paper_max_chars: int,
     pdf_input_max_chars: int,
+    run_dir: Path,
 ) -> PaperExtraction:
     """Worker body: fetch text, call extractor LLM, return :class:`PaperExtraction`.
 
@@ -203,29 +227,32 @@ def _extract_one_paper(
         )
 
     # ------- fetch ----------------------------------------------------
-    try:
-        # Reuse the PdfRecord shape PdfClawBridge expects (paper_id +
-        # external_ids + pdf_url + title).  We rebuild it here to avoid
-        # depending on PaperRecord's full constructor surface — keeps
-        # this module decoupled from the pipeline's model.
-        from citeclaw.models import PaperRecord
+    # Disk-first: when ``fetch-pdfs`` has been run, the parsed/<id>.json
+    # file is the authoritative source and bypasses any stale "no_pdf"
+    # cache row that the original pipeline may have written before the
+    # PDF was downloadable.  The bridge fallback covers papers added
+    # after fetch-pdfs (or runs where fetch-pdfs was never run).
+    text = _read_parsed_text_from_disk(run_dir, pid)
+    if text is None:
+        try:
+            from citeclaw.models import PaperRecord
 
-        pdf_url = paper.get("pdf_url") or ""
-        external_ids = paper.get("external_ids") or {}
-        rec = PaperRecord(
-            paper_id=pid,
-            title=title,
-            year=year,
-            external_ids=external_ids,
-            pdf_url=pdf_url,
-        )
-        text = bridge.fetch_text(rec)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("meta-review: fetch failed for %s: %s", pid[:20], exc)
-        return PaperExtraction(
-            paper_id=pid, title=title, year=year, authors=authors,
-            venue=venue, error=f"fetch failed: {exc}",
-        )
+            pdf_url = paper.get("pdf_url") or ""
+            external_ids = paper.get("external_ids") or {}
+            rec = PaperRecord(
+                paper_id=pid,
+                title=title,
+                year=year,
+                external_ids=external_ids,
+                pdf_url=pdf_url,
+            )
+            text = bridge.fetch_text(rec)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("meta-review: fetch failed for %s: %s", pid[:20], exc)
+            return PaperExtraction(
+                paper_id=pid, title=title, year=year, authors=authors,
+                venue=venue, error=f"fetch failed: {exc}",
+            )
 
     if not text:
         return PaperExtraction(
@@ -391,6 +418,7 @@ def run_meta_review(
     parser_kwargs: dict | None = None,
     headless: bool = True,
     output_path: Path | None = None,
+    from_extractions: Path | None = None,
 ) -> MetaReviewResult:
     """Run the full meta-review pipeline on a finished CiteClaw run directory.
 
@@ -402,6 +430,71 @@ def run_meta_review(
     from citeclaw.cache import Cache
     from citeclaw.clients.llm.factory import build_llm_client
     from citeclaw.clients.pdfclaw_bridge import PdfClawBridge
+
+    # ---- short-circuit: re-meta from a prior sidecar --------------------
+    # When ``from_extractions`` is set, we skip the entire per-paper pass
+    # and re-feed an existing sidecar into the meta LLM.  Useful for
+    # iterating on the synthesis prompt or recovering from a meta-side
+    # failure (rate limit, balance hiccup) without spending another
+    # 60+ extractor calls.  ``max_papers`` and ``per_paper_max_chars``
+    # apply here too: they let the caller shrink the corpus to fit a
+    # tighter-context meta model than was originally used.
+    if from_extractions is not None:
+        sidecar = json.loads(from_extractions.read_text(encoding="utf-8"))
+        extractions = [
+            PaperExtraction(
+                paper_id=e.get("paper_id", ""),
+                title=e.get("title", ""),
+                year=e.get("year"),
+                authors=e.get("authors") or [],
+                venue=e.get("venue", "") or "",
+                extraction=(e.get("extraction") or "")[:per_paper_max_chars],
+                error=e.get("error", "") or "",
+            )
+            for e in sidecar.get("extractions", [])
+        ]
+        if max_papers is not None:
+            # Keep the successful extractions first so the cap doesn't
+            # silently waste room on skipped papers (which contribute
+            # nothing to the corpus anyway).
+            extractions.sort(key=lambda e: 0 if e.extraction else 1)
+            extractions = extractions[:max_papers]
+        # Use the instruction from the sidecar when the CLI didn't
+        # supply one — keeps the meta-prompt consistent with the
+        # per-paper pass that produced these extractions.
+        instr = instruction or sidecar.get("instruction") or ""
+        budget = BudgetTracker()
+        cache_path = run_dir / "cache.db"
+        cache = Cache(cache_path) if cache_path.exists() else None
+        meta_llm = build_llm_client(
+            config, budget,
+            model=meta_model,
+            reasoning_effort=meta_reasoning,
+            cache=cache,
+        )
+        log.info(
+            "meta-review: loaded %d extractions from %s — meta synthesis only",
+            len(extractions), from_extractions,
+        )
+        report_md = _run_meta_synthesis(extractions, meta_llm, instr)
+        output_path = output_path or (run_dir / "meta_review.md")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report_md, encoding="utf-8")
+        log.info(
+            "meta-review: wrote %s (%d chars), %s",
+            output_path, len(report_md), budget.summary(),
+        )
+        n_extracted = sum(1 for e in extractions if e.extraction)
+        return MetaReviewResult(
+            instruction=instr,
+            extractor_model=sidecar.get("extractor_model", "(from sidecar)"),
+            meta_model=meta_model,
+            extractions=extractions,
+            report_markdown=report_md,
+            n_papers_total=len(extractions),
+            n_papers_extracted=n_extracted,
+            n_papers_skipped=len(extractions) - n_extracted,
+        )
 
     # ---- load collection --------------------------------------------------
     collection_path = run_dir / "literature_collection.json"
@@ -463,6 +556,7 @@ def run_meta_review(
                     _extract_one_paper, p, bridge, extractor_llm, instruction,
                     per_paper_max_chars=per_paper_max_chars,
                     pdf_input_max_chars=pdf_input_max_chars,
+                    run_dir=run_dir,
                 ): p
                 for p in papers
             }
