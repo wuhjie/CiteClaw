@@ -169,6 +169,47 @@ class PdfClawBridge:
     def __exit__(self, *exc):
         self.close()
 
+    def fetch_pdf_bytes(self, paper: "PaperRecord") -> bytes | None:
+        """Like :meth:`fetch_text`, but stops at the raw PDF bytes.
+
+        Used by code paths that need *structured* parser output (e.g.
+        GROBID's TEI ``<biblStruct>`` references) which the body-text
+        cache can't carry.  Skips the ``paper_full_text`` cache for
+        successes — that cache only stores ``text``, so reading from
+        it gives us nothing useful for callers that want bytes — but
+        still respects the cached error rows (``no_pdf``,
+        ``download_failed``, ``parse_failed``, ``too_large``) so we
+        don't re-download a known-broken paper for every reader.
+
+        Returns ``None`` for paths that only ever produce body text
+        (publisher recipes like Elsevier TDM / EuropePMC BioC that
+        return XML directly), or when every fallback layer fails.
+        """
+        if not paper.paper_id:
+            return None
+
+        cached = self._cache.get_full_text(paper.paper_id)
+        if cached is not None and cached.get("error") in (
+            "no_pdf", "download_failed", "parse_failed", "too_large",
+        ):
+            return None
+
+        # HTTP path — S2's openAccessPdf URL
+        if paper.pdf_url:
+            try:
+                body, err = download_pdf_bytes(self._http, paper.pdf_url)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "fetch_pdf_bytes: http failed for %s: %s",
+                    paper.paper_id[:20], exc,
+                )
+                body, err = None, exc
+            if err is None and body:
+                return body
+
+        # PDFClaw browser-recipe path
+        return self._try_pdfclaw_bytes(paper)
+
     # ------------------------------------------------------------------
     # Layer 2: HTTP
     # ------------------------------------------------------------------
@@ -247,6 +288,75 @@ class PdfClawBridge:
                     "pdfclaw: recipe %s needs auth; suppressed for this run",
                     recipe.name,
                 )
+                continue
+
+            if recipe.needs_browser and result.status in ("error", "blocked"):
+                self._bump_failures(recipe.name)
+
+        return None
+
+    def _try_pdfclaw_bytes(self, paper: "PaperRecord") -> bytes | None:
+        """Same fallback chain as :meth:`_try_pdfclaw` but returns the
+        recipe's raw ``pdf_bytes``.  Text-only recipes (Elsevier TDM
+        XML, EuropePMC BioC) come back as ``None`` here because they
+        never produce a PDF — the caller falls back to whatever
+        text-based path makes sense for that recipe.
+
+        Locked the same way as :meth:`_try_pdfclaw` so concurrent
+        ExpandBackward / ExpandByPDF workers don't race on the browser.
+        """
+        with self._pdfclaw_lock:
+            return self._try_pdfclaw_bytes_locked(paper)
+
+    def _try_pdfclaw_bytes_locked(self, paper: "PaperRecord") -> bytes | None:
+        if not self._ensure_pdfclaw():
+            return None
+        doi = self._extract_doi(paper)
+        if not doi:
+            return None
+
+        from pdfclaw.publishers import find_recipes
+        from pdfclaw.publishers.base import STATUS_AUTH
+
+        recipes = find_recipes(doi, self._registry)
+        if not recipes:
+            return None
+
+        for recipe in recipes:
+            if recipe.name in self._auth_failed:
+                continue
+
+            if recipe.needs_browser:
+                page = self._ensure_browser()
+                if page is None:
+                    continue
+            else:
+                page = None
+
+            try:
+                result = recipe.fetch(
+                    paper.paper_id,
+                    doi,
+                    browser_page=page if recipe.needs_browser else None,
+                    http=self._http if not recipe.needs_browser else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.debug("pdfclaw recipe %s raised: %s", recipe.name, exc)
+                if recipe.needs_browser:
+                    self._bump_failures(recipe.name)
+                continue
+
+            if result.ok:
+                self._consecutive_failures[recipe.name] = 0
+                if result.pdf_bytes:
+                    return result.pdf_bytes
+                # body_text-only recipes (Elsevier TDM, EuropePMC, …)
+                # produce no PDF — keep walking other recipes in case a
+                # later one does.
+                continue
+
+            if result.status == STATUS_AUTH:
+                self._auth_failed.add(recipe.name)
                 continue
 
             if recipe.needs_browser and result.status in ("error", "blocked"):

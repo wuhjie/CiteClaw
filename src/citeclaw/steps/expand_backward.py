@@ -2,11 +2,21 @@
 
 When ``pdf_references=True``, papers whose S2 reference list is empty
 (not indexed, too new, or grey literature) get a PDF-based fallback:
-the step fetches the paper's full text, extracts all reference titles
-via a simple heuristic parser, resolves them through
-``ctx.s2.search_match``, and feeds the resolved candidates into the
-normal screening pipeline.  This complements the S2 API path without
-replacing it — S2 references are always tried first.
+the step fetches the paper's PDF and extracts references, then resolves
+them through ``ctx.s2.fetch_metadata`` (DOI-first) and ``ctx.s2.search_match``
+(title fallback).  Two parser modes:
+
+  * ``parser="grobid"``: download raw PDF bytes (cache → S2 HTTP →
+    pdfclaw recipes), POST to the deployed GROBID server, consume the
+    structured ``<biblStruct>`` references directly.  Each ref entry
+    is a cleanly-extracted bibliography line with the title, authors,
+    year and (when present) DOI preserved.
+  * default ``parser="pymupdf"``: use the legacy regex heuristic over
+    body text — coarser but no GROBID dependency, kept for backward
+    compatibility.
+
+S2 references are always tried first; the PDF fallback only fires when
+both S2 and OpenAlex come back empty.
 """
 
 from __future__ import annotations
@@ -110,18 +120,32 @@ def _guess_title(entry: str) -> str | None:
 class ExpandBackward:
     name = "ExpandBackward"
 
+    # Strict DOI pattern mirroring :mod:`citeclaw.models` — used to lift
+    # DOIs out of GROBID-formatted reference strings so we can hit
+    # ``s2.fetch_metadata`` (deterministic) before falling back to
+    # ``search_match`` (fuzzy title query).
+    _DOI_EXTRACT_RE = re.compile(r"\b(10\.\d{4,9}/[^\s,;)\]]+)")
+
     def __init__(
         self,
         *,
         screener=None,
         pdf_references: bool = False,
         pdf_model: str | None = None,
+        parser: str = "pymupdf",
+        parser_kwargs: dict | None = None,
         headless: bool = True,
         openalex_references: bool = True,
     ) -> None:
         self.screener = screener
         self.pdf_references = pdf_references
         self.pdf_model = pdf_model
+        # Parser engine for the PDF fallback.  ``"grobid"`` takes the
+        # structured-TEI path (best reference quality, requires the
+        # ``PDFCLAW_GROBID_URL`` env var pointing at a running server);
+        # anything else takes the legacy regex-on-body-text heuristic.
+        self.parser = parser
+        self.parser_kwargs = parser_kwargs or {}
         self.headless = headless
         # OpenAlex reference fallback — used when S2 returns empty refs
         # AND the paper has a DOI in external_ids. Cheap (one OpenAlex
@@ -313,61 +337,152 @@ class ExpandBackward:
         source: PaperRecord,
         ctx: Any,
     ) -> list[PaperRecord]:
-        """Extract references from the source paper's PDF.
+        """Extract references from the source paper's PDF, then resolve via S2.
 
-        Returns a list of PaperRecords for each resolved reference.
-        Uses the PdfClawBridge for PDF fetching and a lightweight
-        heuristic parser for reference extraction (no LLM required).
+        Two paths depending on ``self.parser``:
+
+        * ``"grobid"``: download PDF bytes, hand them to GROBID for TEI
+          parsing, and consume the structured ``<biblStruct>`` references
+          directly.  Each ref string is a clean bibliography line; the
+          resolver tries a DOI regex first, then ``s2.search_match`` on
+          the whole string.
+        * other values (default ``"pymupdf"``): use the legacy regex
+          heuristic over body text.  Kept for backward compatibility and
+          for environments without a GROBID server.
+
+        Returns the list of resolved ``PaperRecord``s (may be empty).
         """
         from citeclaw.clients.pdfclaw_bridge import PdfClawBridge
 
-        bridge = PdfClawBridge(ctx.cache, headless=self.headless)
+        bridge = PdfClawBridge(
+            ctx.cache,
+            headless=self.headless,
+            parser=self.parser,
+            parser_kwargs=self.parser_kwargs,
+        )
         try:
-            text = bridge.fetch_text(source)
+            if self.parser == "grobid":
+                ref_strings = self._grobid_ref_strings(bridge, source)
+            else:
+                text = bridge.fetch_text(source)
+                ref_strings = _extract_all_ref_titles(text) if text else []
         finally:
             bridge.close()
 
-        if not text:
+        if not ref_strings:
             log.debug(
-                "pdf_references fallback: no text for %s", source.paper_id[:20],
+                "pdf_references fallback (%s): no refs for %s",
+                self.parser, source.paper_id[:20],
             )
             return []
 
-        titles = _extract_all_ref_titles(text)
-        if not titles:
-            return []
-
         log.info(
-            "pdf_references fallback: extracted %d reference titles from %s",
-            len(titles), source.paper_id[:20],
+            "pdf_references fallback (%s): extracted %d references from %s",
+            self.parser, len(ref_strings), source.paper_id[:20],
         )
 
         records: list[PaperRecord] = []
-        for title in titles:
-            try:
-                match = ctx.s2.search_match(title)
-            except Exception as exc:  # noqa: BLE001
-                # Per-title search_match failure is recoverable (the
-                # heuristic title extraction is rough — many candidates
-                # legitimately don't match anything in S2). DEBUG-log
-                # so the diagnostic trail exists.
-                log.debug("pdf_references: search_match for %r failed: %s",
-                          title[:60], exc)
-                continue
-            if match is None:
-                continue
-            pid = match.get("paperId")
-            if not pid:
-                continue
-            # Build a lightweight PaperRecord from the match.
-            from citeclaw.clients.s2.converters import paper_to_record
-
-            rec = paper_to_record(match)
+        for ref_text in ref_strings:
+            rec = self._resolve_ref_string(ref_text, ctx)
             if rec:
                 records.append(rec)
 
         log.info(
-            "pdf_references fallback: resolved %d / %d titles for %s",
-            len(records), len(titles), source.paper_id[:20],
+            "pdf_references fallback (%s): resolved %d / %d for %s",
+            self.parser, len(records), len(ref_strings), source.paper_id[:20],
         )
         return records
+
+    def _grobid_ref_strings(
+        self,
+        bridge: Any,
+        source: PaperRecord,
+    ) -> list[str]:
+        """Fetch PDF bytes, run GROBID, return the structured-ref list.
+
+        On any GROBID-side failure (server down, parser error, malformed
+        TEI) falls back to PyMuPDF body text + the regex heuristic so the
+        whole step still makes a best-effort attempt rather than dropping
+        the paper.
+        """
+        body = bridge.fetch_pdf_bytes(source)
+        if not body:
+            return []
+
+        from pdfclaw.parsers import parse as parse_pdf
+
+        try:
+            result = parse_pdf(body, parser="grobid", **self.parser_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "pdf_references: GROBID failed for %s (%s) — falling back to heuristic",
+                source.paper_id[:20], exc,
+            )
+            try:
+                result = parse_pdf(body, parser="pymupdf")
+            except Exception as exc2:  # noqa: BLE001
+                log.debug(
+                    "pdf_references: pymupdf fallback also failed for %s: %s",
+                    source.paper_id[:20], exc2,
+                )
+                return []
+            return _extract_all_ref_titles(result.body_text or "")
+
+        return list(result.references or [])
+
+    def _resolve_ref_string(
+        self,
+        ref_text: str,
+        ctx: Any,
+    ) -> PaperRecord | None:
+        """Resolve one bibliography string to an S2 ``PaperRecord``.
+
+        Cascade:
+
+          1. Regex-extract a DOI; ``s2.fetch_metadata("DOI:<doi>")`` is
+             deterministic when it returns something.
+          2. Fall back to ``s2.search_match`` on the whole ref string.
+             S2's search is fuzzy enough that feeding it ``"[67] Smith,
+             J. et al. Title. Journal vol(issue):pages."`` typically
+             still locks onto the title.
+
+        Returns ``None`` when both paths fail (logged at DEBUG so the
+        diagnostic trail exists without spam at INFO).
+        """
+        ref_text = ref_text.strip()
+        if len(ref_text) < 12:
+            return None
+
+        # DOI-first path.
+        m = self._DOI_EXTRACT_RE.search(ref_text)
+        if m:
+            doi = m.group(1).rstrip(".,;)]")
+            try:
+                rec = ctx.s2.fetch_metadata(f"DOI:{doi}")
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "pdf_references: DOI lookup failed for %r: %s",
+                    doi, exc,
+                )
+            else:
+                if rec is not None:
+                    return rec
+
+        # Title / full-line fuzzy search.
+        try:
+            match = ctx.s2.search_match(ref_text)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "pdf_references: search_match failed for %r: %s",
+                ref_text[:60], exc,
+            )
+            return None
+        if match is None:
+            return None
+        pid = match.get("paperId")
+        if not pid:
+            return None
+
+        from citeclaw.clients.s2.converters import paper_to_record
+
+        return paper_to_record(match)
