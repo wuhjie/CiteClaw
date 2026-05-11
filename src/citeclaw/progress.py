@@ -524,36 +524,66 @@ class Dashboard(NullDashboard):
 
     # ── inner / outer bar driving ────────────────────────────────────────
 
+    def _inner_task_obj(self):
+        """Look up the Rich ``Task`` object for the current inner task.
+
+        Direct mutation of ``task.total`` is the only way to switch a
+        task BACK to indeterminate — both ``Progress.reset(total=None)``
+        and ``Progress.update(total=None)`` treat ``None`` as "leave
+        total alone" (see Rich 14 ``progress.py``). Returns ``None`` if
+        the inner task no longer exists.
+        """
+        if self._progress is None or self._inner_task is None:
+            return None
+        return next(
+            (t for t in self._progress.tasks if t.id == self._inner_task),
+            None,
+        )
+
     def begin_phase(self, description: str, total: int | None) -> None:
         """Reset the inner bar to a new phase.
 
         ``total=None`` renders an indeterminate (pulsing) bar — use it
         when the caller knows work is happening but can't predict the
-        unit count (e.g. paginating refs with no known page count).
+        unit count (e.g. paginating refs with no known page count, or
+        an atomic batched call that returns all results at once).
         Any callable that ticks the inner bar thereafter bumps the
-        displayed "completed" counter.
+        displayed "completed" counter but the bar stays indeterminate
+        until ``complete_phase`` snaps total to completed.
         """
         if self._progress is None or self._inner_task is None:
             return
         self._inner_total = None if total is None else max(1, total)
-        # Rich's Progress.reset() treats total=None as "keep the current
-        # total", so we can't use it to switch INTO indeterminate mode.
-        # Reset completed/description via reset(), then set the real
-        # total via update() so None actually propagates.
+        # Rich's reset() drops the progress samples + zeroes completed,
+        # but won't accept ``total=None`` (it's interpreted as "keep
+        # current total"). Pass a placeholder 1, then mutate the Task
+        # directly when we actually want indeterminate.
         self._progress.reset(
             self._inner_task,
             total=self._inner_total if self._inner_total is not None else 1,
             description=f"now: {description}",
         )
         if self._inner_total is None:
-            self._progress.update(self._inner_task, total=None)
+            task = self._inner_task_obj()
+            if task is not None:
+                task.total = None
 
     def retotal_phase(self, total: int | None) -> None:
-        """Adjust the inner bar's total without resetting completed."""
+        """Adjust the inner bar's total without resetting completed.
+
+        Like :meth:`begin_phase`, switching back to indeterminate
+        (``total=None``) requires direct Task mutation since Rich's
+        ``update(total=None)`` is a no-op.
+        """
         if self._progress is None or self._inner_task is None:
             return
         self._inner_total = None if total is None else max(1, total)
-        self._progress.update(self._inner_task, total=self._inner_total)
+        if self._inner_total is None:
+            task = self._inner_task_obj()
+            if task is not None:
+                task.total = None
+        else:
+            self._progress.update(self._inner_task, total=self._inner_total)
 
     def tick_inner(self, n: int = 1) -> None:
         if self._progress is None or self._inner_task is None:
@@ -568,10 +598,7 @@ class Dashboard(NullDashboard):
         if self._progress is None or self._inner_task is None:
             return
         if self._inner_total is None:
-            task = next(
-                (t for t in self._progress.tasks if t.id == self._inner_task),
-                None,
-            )
+            task = self._inner_task_obj()
             completed = int(task.completed) if task else 0
             self._inner_total = max(1, completed)
             self._progress.update(
