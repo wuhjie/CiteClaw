@@ -83,7 +83,7 @@ class ExpandForward:
                 ctx.seen.add(c["paper_id"])
             dash.note_candidates_seen(len(unseen))
 
-            dash.begin_phase("fetch source refs", total=1)
+            dash.begin_phase("fetch source refs", total=None)
             try:
                 source_refs = set(ctx.s2.fetch_reference_ids(source.paper_id))
             except Exception as exc:  # noqa: BLE001
@@ -96,11 +96,11 @@ class ExpandForward:
                     source.paper_id[:20], exc,
                 )
                 source_refs = set()
-            dash.tick_inner(1)
+            dash.complete_phase()
 
             source_citers = {c.get("paper_id") for c in citers if c.get("paper_id")}
 
-            dash.begin_phase("enrich · batch", total=1)
+            dash.begin_phase("enrich · batch", total=None)
             records = ctx.s2.enrich_batch(unseen)
             for rec in records:
                 rec.depth = source.depth + 1
@@ -108,14 +108,18 @@ class ExpandForward:
                 rec.supporting_papers = [source.paper_id]
                 if source.paper_id not in rec.references:
                     rec.references.append(source.paper_id)
-            dash.tick_inner(1)
+            dash.complete_phase()
 
-            # Need abstracts for title_abstract LLMFilters. Size the
-            # bar to the records that still need a live fetch so the
-            # user sees real progress if S2 falls back to per-paper
-            # singletons (slow path at ~1 rps per miss).
-            n_miss = sum(1 for r in records if not r.abstract)
-            dash.begin_phase("enrich · abstracts", total=max(1, n_miss))
+            # Need abstracts for title_abstract LLMFilters. S2's batch
+            # endpoint handles up to 500 papers per POST, so any normal
+            # enrich call is one atomic round-trip — a fake N-paper
+            # total just sits at 0 until the response lands and then
+            # snaps to N. Use indeterminate so the bar pulses while the
+            # request is in flight. The per-chunk tick still bumps the
+            # internal counter, which complete_phase snaps to total at
+            # end. Falls back to the per-paper slow path only on batch
+            # failure (logged at WARNING in _batch_fetch).
+            dash.begin_phase("enrich · abstracts", total=None)
             ctx.s2.enrich_with_abstracts(records, progress_cb=dash.tick_inner)
             dash.complete_phase()
 

@@ -61,12 +61,16 @@ def _apply_sequential(
             break
         in_count = len(passed)
         # Tell the dashboard which filter is running and how many papers
-        # it's about to chew on. LLM filters re-set the total in their
-        # dispatcher (to account for voting); cheap filters complete
-        # the bar in a single tick after the call returns.
+        # it's about to chew on. LLM filters run as atomic batched calls
+        # — futures complete all-at-once per batch, so a fake N-paper
+        # total just sits at 0 until the LLM responds and then snaps to
+        # N. Pulse instead; complete_phase snaps total at end. Cheap
+        # synchronous filters keep the determinate N-paper bar (they
+        # tick per paper or in one shot after returning).
         if dash is not None:
             layer_name = getattr(layer, "name", type(layer).__name__)
-            dash.begin_phase(layer_name, total=in_count)
+            total: int | None = None if _is_llm_layer(layer) else in_count
+            dash.begin_phase(layer_name, total=total)
         p, r = apply_block(passed, layer, fctx)
         passed = p
         rejected.extend(r)

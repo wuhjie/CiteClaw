@@ -222,12 +222,13 @@ class ExpandBackward:
                 continue
             dash.note_candidates_seen(len(cands))
 
-            # Size the bar to the cands that actually need a live
-            # fetch (local cache hits complete instantly). The callback
-            # ticks once per S2 batch (or per singleton when the batch
-            # path fails and fallback to per-paper GETs kicks in).
-            n_miss = sum(1 for r in cands if not r.abstract)
-            dash.begin_phase("enrich · abstracts", total=max(1, n_miss))
+            # S2's batch endpoint handles up to 500 papers per POST,
+            # so any normal enrich call is one atomic round-trip —
+            # use indeterminate so the bar pulses while the request
+            # is in flight rather than sitting at 0/N and snapping to
+            # N/N. Per-chunk ticks still bump the internal counter
+            # (complete_phase snaps total to it at the end).
+            dash.begin_phase("enrich · abstracts", total=None)
             ctx.s2.enrich_with_abstracts(cands, progress_cb=dash.tick_inner)
             dash.complete_phase()
 
