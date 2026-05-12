@@ -177,11 +177,12 @@ class ExpandBySearch:
         return AgentConfig(
             max_iterations=max_iter,
             max_papers_per_iteration=int(
-                self.agent.get("max_papers_per_iteration", 1000),
+                self.agent.get("max_papers_per_iteration", 10_000),
             ),
             max_llm_tokens=int(self.agent.get("max_llm_tokens", 50_000)),
             model=model,
             reasoning_effort=reasoning_effort,
+            sort=self.agent.get("sort") or None,
         )
 
     def _fingerprint(self, signal: list[PaperRecord]) -> str:

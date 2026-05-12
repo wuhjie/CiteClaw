@@ -45,13 +45,21 @@ class AgentConfig:
     Built from the YAML ``agent:`` sub-dict on the ``ExpandBySearch`` step.
     Unknown keys are silently ignored so a richer future schema (used by
     the multi-turn supervisor) doesn't fail-build today's 1-shot pipeline.
+
+    ``max_papers_per_iteration`` is the *total* cap on candidates per
+    iteration, NOT the per-call limit (S2's ``/paper/search/bulk`` caps
+    each call at 1000; we paginate using the ``token`` field until we
+    hit this cap or exhaust the query's matches). Setting this above
+    10K is fine but each extra page costs one S2 request, so 10K is a
+    reasonable default for a single broad query.
     """
 
     max_iterations: int = 1
-    max_papers_per_iteration: int = 1000
+    max_papers_per_iteration: int = 10_000
     max_llm_tokens: int = 50_000
     model: str | None = None
     reasoning_effort: str | None = None
+    sort: str | None = None  # None / "paperId" / "publicationDate[:asc|desc]" / "citationCount[:asc|desc]"
 
 
 @dataclass
@@ -243,38 +251,72 @@ def run_iterative_search(
             i + 1, query_natural[:120], query_s2[:120],
         )
 
-        try:
-            result = ctx.s2.search_bulk(
-                query_s2,
-                limit=min(max(1, config.max_papers_per_iteration), 1000),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "ExpandBySearch agent: search_bulk failed on iter %d: %s",
-                i + 1, exc,
-            )
-            turns.append(AgentTurn(
-                iteration=i + 1, raw_response=raw,
-                query_natural=query_natural, query_s2=query_s2,
-                total=0, new_ids=[],
-            ))
-            break
-
-        data = result.get("data") if isinstance(result, dict) else None
-        total = (
-            int(result.get("total", 0))
-            if isinstance(result, dict) and isinstance(result.get("total"), int)
-            else 0
-        )
+        # Paginate through S2 ``/paper/search/bulk`` (1000 results per
+        # page; ``token`` continues to the next page). We stop when we
+        # hit ``max_papers_per_iteration``, exhaust the query's matches,
+        # or get an error.
+        cap = max(1, int(config.max_papers_per_iteration))
+        per_page = 1000  # S2 server-side max per call
+        next_token: str | None = None
+        page_num = 0
         new_ids: list[str] = []
-        for entry in data or []:
-            if not isinstance(entry, dict):
-                continue
-            pid = entry.get("paperId")
-            if isinstance(pid, str) and pid and pid not in seen_pids:
-                seen_pids.add(pid)
-                aggregate.append(pid)
-                new_ids.append(pid)
+        total = 0
+        broke_on_error = False
+
+        while True:
+            try:
+                result = ctx.s2.search_bulk(
+                    query_s2,
+                    limit=per_page,
+                    token=next_token,
+                    sort=config.sort,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "ExpandBySearch agent: search_bulk failed on iter %d page %d: %s",
+                    i + 1, page_num + 1, exc,
+                )
+                broke_on_error = True
+                break
+
+            if not isinstance(result, dict):
+                break
+
+            page_data = result.get("data") or []
+            if page_num == 0 and isinstance(result.get("total"), int):
+                total = int(result["total"])
+
+            page_added = 0
+            for entry in page_data:
+                if not isinstance(entry, dict):
+                    continue
+                pid = entry.get("paperId")
+                if isinstance(pid, str) and pid and pid not in seen_pids:
+                    seen_pids.add(pid)
+                    aggregate.append(pid)
+                    new_ids.append(pid)
+                    page_added += 1
+                if len(new_ids) >= cap:
+                    break
+
+            page_num += 1
+            log.info(
+                "ExpandBySearch agent iter %d page %d: +%d ids (running total %d / cap %d, S2 total %d)",
+                i + 1, page_num, page_added, len(new_ids), cap, total,
+            )
+
+            if len(new_ids) >= cap:
+                log.info(
+                    "ExpandBySearch agent iter %d: hit cap %d, stopping pagination",
+                    i + 1, cap,
+                )
+                break
+
+            next_token = result.get("token") if isinstance(result, dict) else None
+            if not next_token:
+                break  # No more pages.
+            if not page_data:
+                break  # Defensive: empty page with a token = end.
 
         turns.append(AgentTurn(
             iteration=i + 1, raw_response=raw,
@@ -282,8 +324,11 @@ def run_iterative_search(
             total=total, new_ids=new_ids,
         ))
         log.info(
-            "ExpandBySearch agent iter %d: total=%d new=%d aggregate=%d",
-            i + 1, total, len(new_ids), len(aggregate),
+            "ExpandBySearch agent iter %d: matched=%d on S2; fetched=%d across %d pages; aggregate=%d",
+            i + 1, total, len(new_ids), page_num, len(aggregate),
         )
+
+        if broke_on_error:
+            break
 
     return aggregate, turns
