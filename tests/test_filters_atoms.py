@@ -76,17 +76,21 @@ class TestCitationFilter:
         assert f.check(p, _fctx(ctx)).passed
 
     def test_low_citation_rejected(self, ctx):
+        """A paper from N years ago needs ``N * beta`` citations."""
         f = CitationFilter(beta=50)
-        # Recent paper with only a few citations — 1 year * 50 = 50 threshold
-        p = PaperRecord(paper_id="p", year=datetime.now().year, citation_count=1)
+        # 5-year-old paper with only a few citations — 5 * 50 = 250 threshold.
+        # Current-year papers would be exempt under the new default, so the
+        # test pins to an older year to actually hit the citation gate.
+        p = PaperRecord(paper_id="p", year=datetime.now().year - 5, citation_count=1)
         out = f.check(p, _fctx(ctx))
         assert not out.passed
         assert out.category == "citation"
 
     def test_years_floor_at_one(self, ctx):
         """A paper from the current year uses ``max(diff, 1)`` so a single
-        citation isn't held to a 0-threshold bar."""
-        f = CitationFilter(beta=1)
+        citation isn't held to a 0-threshold bar. Also pin the exemption off
+        so the citation threshold actually runs."""
+        f = CitationFilter(beta=1, exemption_years=-1)
         p = PaperRecord(paper_id="p", year=datetime.now().year, citation_count=1)
         assert f.check(p, _fctx(ctx)).passed
 
@@ -124,16 +128,26 @@ class TestCitationFilter:
         out = f.check(p, _fctx(ctx))
         assert not out.passed
 
-    def test_exemption_default_none_preserves_strict_behaviour(self, ctx):
-        """Default exemption_years=None must NOT exempt current-year papers."""
+    def test_exemption_default_zero_exempts_current_year(self, ctx):
+        """Default exemption_years=0 exempts current-year papers.
+
+        Default flipped 2026-05 from None (strict) to 0 because SPECTER2
+        recommendations and broad search agents almost always return
+        current-year papers with 0 citations — under the old default the
+        citation gate killed 78% of legitimate on-topic candidates."""
         f = CitationFilter(beta=50, reference_year=2026)
         p = PaperRecord(paper_id="p", year=2026, citation_count=1)
         out = f.check(p, _fctx(ctx))
-        assert not out.passed
+        assert out.passed
 
-    def test_exemption_negative_raises(self):
-        with pytest.raises(ValueError, match="exemption_years must be >= 0"):
-            CitationFilter(beta=5, exemption_years=-1)
+    def test_exemption_negative_one_means_strict(self, ctx):
+        """exemption_years=-1 opts BACK IN to the pre-2026-05 strict
+        behaviour: even current-year papers must clear beta."""
+        f = CitationFilter(beta=50, exemption_years=-1, reference_year=2026)
+        p = PaperRecord(paper_id="p", year=2026, citation_count=1)
+        out = f.check(p, _fctx(ctx))
+        assert not out.passed
+        assert out.category == "citation"
 
     def test_reference_year_used_for_age_math(self, ctx):
         """Pinning reference_year affects threshold = (ref - year) * beta."""

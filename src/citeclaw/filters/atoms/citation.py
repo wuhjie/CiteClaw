@@ -29,12 +29,24 @@ class CitationFilter:
       exemption window. Defaults to the current calendar year. Pin it
       to keep results reproducible across runs that span a year
       boundary.
-    * ``exemption_years`` — when set to an int ``N >= 0``, papers
-      published in the last ``N`` years (i.e. ``year >= reference_year - N``)
-      skip the citation check entirely. ``N=0`` grants the exemption
-      only to papers from ``reference_year`` itself; ``N=1`` adds the
-      year before, etc. Defaults to ``None`` (no exemption — preserves
-      the original strict behaviour).
+    * ``exemption_years`` — papers from the last ``N+1`` years skip
+      the citation check. The semantics work as follows:
+
+        * ``N = 0`` (the default): only papers published in
+          ``reference_year`` itself skip — current-calendar-year work
+          almost always has zero citations on S2, so without this the
+          SPECTER2 / search-agent expansion has nothing to feed into
+          the citation gate.
+        * ``N = 1``: ``reference_year`` AND ``reference_year - 1`` skip
+          (i.e. last-two-years window).
+        * ``N = -1``: disable the exemption entirely — every paper
+          must clear ``years_since * beta``, matching the original
+          pre-2026-05 strict behaviour. Use this when you genuinely
+          want to filter out brand-new work that hasn't earned its
+          citations yet.
+
+      Note that the implementation accepts any integer; values < -1 are
+      treated the same as -1 (no exemption).
     """
 
     def __init__(
@@ -42,13 +54,9 @@ class CitationFilter:
         name: str = "citation",
         *,
         beta: float = 5.0,
-        exemption_years: int | None = None,
+        exemption_years: int = 0,
         reference_year: int | None = None,
     ) -> None:
-        if exemption_years is not None and exemption_years < 0:
-            raise ValueError(
-                f"exemption_years must be >= 0 when set, got {exemption_years}"
-            )
         self.name = name
         self._beta = beta
         self._exemption_years = exemption_years
@@ -69,7 +77,7 @@ class CitationFilter:
         """
         anchor = self._reference_year if self._reference_year is not None else _current_year()
         if (
-            self._exemption_years is not None
+            self._exemption_years >= 0
             and paper.year is not None
             and paper.year >= anchor - self._exemption_years
         ):
