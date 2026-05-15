@@ -461,7 +461,7 @@ OpenAI-compatible endpoint on Modal. Wire it via the YAML `models:` registry:
 pip install modal && modal setup
 CITECLAW_VLLM_APP_NAME=citeclaw-vllm-gemma \
 CITECLAW_VLLM_MODEL=google/gemma-4-31B-it \
-CITECLAW_VLLM_GPU=B200 CITECLAW_VLLM_GPU_COUNT=1 \
+CITECLAW_VLLM_GPU=H200 CITECLAW_VLLM_GPU_COUNT=1 \
 CITECLAW_VLLM_API_KEY=<bearer> \
 modal deploy modal_vllm_server.py
 ```

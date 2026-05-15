@@ -18,7 +18,7 @@ Quickstart
    shown. All values are read at deploy time and baked into the app:
 
        export CITECLAW_VLLM_MODEL="Qwen/Qwen3.5-122B-A10B-FP8"
-       export CITECLAW_VLLM_GPU="B200"           # or H200, H100, A100-80GB, ...
+       export CITECLAW_VLLM_GPU="H200"           # or B200, H100, A100-80GB, ...
        export CITECLAW_VLLM_GPU_COUNT=1           # tensor parallel degree
        export CITECLAW_VLLM_API_KEY="citeclaw-local-key"
        export CITECLAW_VLLM_MAX_MODEL_LEN=16384
@@ -104,7 +104,7 @@ import modal
 # ---------------------------------------------------------------------------
 
 MODEL_NAME: str = os.environ.get("CITECLAW_VLLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-GPU_TYPE: str = os.environ.get("CITECLAW_VLLM_GPU", "B200")
+GPU_TYPE: str = os.environ.get("CITECLAW_VLLM_GPU", "H200")
 GPU_COUNT: int = int(os.environ.get("CITECLAW_VLLM_GPU_COUNT", "1"))
 API_KEY: str = os.environ.get("CITECLAW_VLLM_API_KEY", "citeclaw-local-key")
 MAX_MODEL_LEN: int = int(os.environ.get("CITECLAW_VLLM_MAX_MODEL_LEN", "16384"))
@@ -320,7 +320,7 @@ _FUNCTION_SECRETS: list[modal.Secret] = (
 # startup_timeout must cover:
 #   1. HuggingFace download of weights (~12 min for Qwen3.5-122B ≈ 127GB, only
 #      on the FIRST cold start before the volume is populated)
-#   2. Loading sharded weights into GPU memory (~30s for TP=2 B200)
+#   2. Loading sharded weights into GPU memory (~30s for TP=2 H200)
 #   3. KV cache profile + FlashInfer kernel warmup (1-3 min on large MoE)
 # 15 min was too tight — the first cold start timed out at 14:51 (port 8000
 # still wasn't up, Modal killed the container mid-warmup). 45 min gives

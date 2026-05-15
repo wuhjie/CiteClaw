@@ -444,7 +444,7 @@ def annotate(
 
     # Concurrency: the Modal vLLM server is configured for up to 256
     # concurrent inputs (`@modal.concurrent(max_inputs=256)`), and measured
-    # KV cache on 2× B200 with Qwen3.5-122B-A10B-FP8 fits ~370 parallel
+    # KV cache on 2× H200 with Qwen3.5-122B-A10B-FP8 fits ~370 parallel
     # 16k-context sequences. 64 workers gives good batch utilization
     # without risking HTTP client timeouts from queueing. If you see
     # 429/timeouts, drop this to 32 or 16.
