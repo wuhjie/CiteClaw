@@ -57,6 +57,7 @@ If `git push` fails, do NOT force-push. Surface the error in the feedback log an
 
 ## Last run feedback (most recent first; keep ≤ 10 entries)
 
+- 2026-05-21 04:32 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
 - 2026-05-21 03:30 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
 - 2026-05-21 02:30 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
 - 2026-05-21 01:28 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
@@ -66,7 +67,6 @@ If `git push` fails, do NOT force-push. Surface the error in the feedback log an
 - 2026-05-20 21:23 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
 - 2026-05-20 20:22 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
 - 2026-05-20 19:21 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
-- 2026-05-20 18:20 — reached Phase F human gate ⛔ (all Phase A–E tasks complete; Phase F is human-gated, awaiting user approval)
 ---
 
 ## Architectural decisions (reference)
